@@ -1254,7 +1254,429 @@ rejected slot 都必然设置为 `-1`。
 只有完成最后一个 prefill chunk 后，生成的 draft token 才被保留并进入
 首次 decode 验证。
 
-## 20. Target 与 Draft 的关系总结
+## 20. Draft K 步的控制边界与调用链
+
+### 20.1 结论先行
+
+标准自回归 Eagle3 的 K 步循环不由 Scheduler 或 ModelRunner 逐步驱动。
+
+ModelRunner 在一个 engine step 中只调用一次：
+
+```python
+self.drafter.propose(...)
+```
+
+这一次调用会在 Proposer 内部同步生成完整的：
+
+```text
+[batch_size, K]
+```
+
+中间的 `K-1` 个自回归步骤不会返回 Scheduler，也不会产生新的调度决策。
+
+更准确地说，`EagleProposer` 是一个很薄的包装类，实际 K 步实现位于其父类
+`SpecDecodeBaseProposer.propose()`：
+
+```text
+vllm/v1/spec_decode/eagle.py
+  -> EagleProposer
+
+vllm/v1/spec_decode/llm_base_proposer.py
+  -> SpecDecodeBaseProposer.propose()
+  -> for token_index in range(K - 1)
+```
+
+因此，“K 步循环在 EagleProposer 内”描述的是逻辑归属；具体 Python
+循环代码在 `llm_base_proposer.py` 的基类实现中。
+
+### 20.2 必须区分的两层循环
+
+推测解码有两层不同粒度的循环：
+
+| 层次 | 循环内容 | 控制者 | 一次迭代 |
+| --- | --- | --- | --- |
+| 外层 | 验证上轮 draft，再生成下轮 draft | Scheduler + ModelRunner | 一个 engine step |
+| 内层 | 连续生成 K 个 draft token | Proposer | 一次 Draft forward |
+
+这里“内层一次迭代等于一次 Draft forward”是指：
+
+```text
+Step 0:
+  first pass -> 产生 d0
+
+后续每次 for 迭代:
+  输入上一个 draft token
+  -> 一次单 token Draft forward
+  -> 产生下一个 draft token
+```
+
+生成 K 个 token 的总调用数量是：
+
+```text
+1 次 first pass + (K - 1) 次单 token Draft forward
+```
+
+### 20.3 完整外层调用链
+
+一个 engine step 的主链路可以表示为：
+
+```text
+EngineCore.step()
+  │
+  ├─ scheduler.schedule()
+  │    ├─ 取出 request.spec_token_ids
+  │    ├─ 形成 scheduled_spec_decode_tokens
+  │    ├─ 分配 Target 本轮 query 所需 KV slots
+  │    └─ 为 Eagle 保留 lookahead 空间
+  │
+  ├─ model_executor.execute_model()
+  │    └─ ModelRunner.execute_model()
+  │         ├─ 准备 [anchor, draft_0, ..., draft_K-1]
+  │         ├─ Target 一次 forward 并行验证
+  │         └─ 保存 logits、hidden 和 auxiliary hidden
+  │
+  ├─ model_executor.sample_tokens()
+  │    └─ ModelRunner.sample_tokens()
+  │         ├─ RejectionSampler 接受/拒绝
+  │         ├─ 整理有效 token 和 rejected 数量
+  │         └─ propose_draft_token_ids()
+  │              └─ self.drafter.propose(...)  # 每个分支只调用一次
+  │                   ├─ first pass -> d0
+  │                   ├─ for token_index in range(K - 1)
+  │                   └─ 返回 [batch_size, K]
+  │
+  ├─ scheduler.update_from_output()
+  │    ├─ 追加 accepted/recovered/bonus token
+  │    └─ 按 rejected 数量回退 num_computed_tokens
+  │
+  └─ EngineCore.post_step()
+       ├─ take_draft_token_ids()
+       └─ scheduler.update_draft_token_ids()
+            └─ request.spec_token_ids = 新一轮 draft
+```
+
+新产生的 draft 在当前 engine step 中不会再交给 Target。它们被保存在
+`request.spec_token_ids`，供下一个 engine step 验证。
+
+### 20.4 Scheduler 实际控制什么
+
+Scheduler 不执行 Draft 的每一个自回归步骤，但提供外层框架。
+
+#### 选择 K
+
+固定配置下：
+
+```text
+K = speculative_config.num_speculative_tokens
+```
+
+如果配置 dynamic speculative decoding，则 Scheduler 根据当前 scheduled
+batch 的请求数量，通过 lookup table 选择本轮 K：
+
+```text
+K = dynamic_sd_lookup[num_scheduled_requests]
+```
+
+这个 K 通过：
+
+```text
+SchedulerOutput.num_spec_tokens_to_schedule
+```
+
+传给 ModelRunner，再传入一次 `drafter.propose()`。
+
+#### 预留 KV 空间
+
+Eagle 初始化时：
+
+```text
+num_lookahead_tokens = num_spec_tokens
+```
+
+Scheduler 在 KV block 分配时预留 lookahead slots，使 Drafter 的内部
+自回归步骤能够安全计算后续 position 和 slot mapping。
+
+#### 组织下一轮 Target 验证
+
+Drafter 返回：
+
+```text
+[d0,d1,...,d(K-1)]
+```
+
+Scheduler 将其保存在：
+
+```text
+request.spec_token_ids
+```
+
+下一轮构造：
+
+```text
+scheduled_spec_decode_tokens
+```
+
+Target 才会一次性验证这些 token。
+
+#### 处理接受/拒绝记账
+
+Target 验证后，Scheduler 计算：
+
+```text
+num_rejected = num_draft_tokens - num_accepted
+num_computed_tokens -= num_rejected
+```
+
+这是 request/engine-step 粒度的状态更新，不会介入 Proposer 内部 K 步。
+
+### 20.5 ModelRunner 实际控制什么
+
+ModelRunner 是一个 engine step 的执行器，负责：
+
+1. 根据 SchedulerOutput 组织 Target 输入；
+2. 运行一次 Target forward；
+3. 调用 RejectionSampler；
+4. 准备 Drafter 的 shifted token、Target hidden 和 attention metadata；
+5. 调用一次 `self.drafter.propose(...)`；
+6. 接收完整 `[batch_size, K]` 结果。
+
+ModelRunner 看不到 Proposer 中间生成的：
+
+```text
+d0
+d1
+...
+d(K-2)
+```
+
+它只能在 `propose()` 返回后拿到完整结果。
+
+### 20.6 Proposer 内部如何生成 K 个 token
+
+以 K=4 为例，prefill 后已有：
+
+```text
+Target 输出: 60
+最后真实 feature: H50
+```
+
+#### First pass
+
+```text
+H50 + E60
+  -> Ĥ60
+  -> d0=70
+```
+
+此时：
+
+```text
+draft_token_ids_list = [70]
+```
+
+#### `for` 第 1 次迭代
+
+```text
+input_id = 70
+hidden   = Ĥ60
+position = 5
+
+Ĥ60 + E70
+  -> Ĥ70
+  -> d1=80
+```
+
+结果：
+
+```text
+[70,80]
+```
+
+#### `for` 第 2 次迭代
+
+```text
+input_id = 80
+hidden   = Ĥ70
+position = 6
+
+Ĥ70 + E80
+  -> Ĥ80
+  -> d2=90
+```
+
+结果：
+
+```text
+[70,80,90]
+```
+
+#### `for` 第 3 次迭代
+
+```text
+input_id = 90
+hidden   = Ĥ80
+position = 7
+
+Ĥ80 + E90
+  -> Ĥ90
+  -> d3=100
+```
+
+最终：
+
+```text
+draft_token_ids = [70,80,90,100]
+shape = [batch_size, 4]
+```
+
+### 20.7 每个内部步骤更新哪些状态
+
+每次 `for` 迭代由 Proposer 自己更新：
+
+```text
+input_ids      = 上一步 draft token
+hidden_states  = 上一步 Draft 输出 feature
+positions      = positions + 1
+seq_lens       = seq_lens + 1
+slot_mapping   = 从 block table 计算新 slot
+draft_index    = token_index + 1
+```
+
+随后：
+
+```text
+构建当前 Draft attention metadata
+-> Draft model forward
+-> 采样 token
+-> 追加到 draft_token_ids_list
+```
+
+位置和 slot mapping 的增量更新使用：
+
+```text
+eagle_step_update_slot_mapping_and_metadata()
+```
+
+如果上一轮存在 rejected token，进入 K 步循环前还会执行：
+
+```text
+seq_lens -= num_rejected_tokens
+```
+
+使自回归从当前请求的有效边界继续。
+
+### 20.8 Batch 内是并行的
+
+虽然 K 维度是串行的，但每一个内部 Draft step 会同时处理 batch 中的所有
+请求。
+
+假设：
+
+```text
+batch_size = 8
+K = 4
+```
+
+执行方式是：
+
+```text
+first pass:
+  8 个请求一起产生 d0
+
+for iteration 0:
+  8 个请求一起输入各自 d0，产生各自 d1
+
+for iteration 1:
+  8 个请求一起输入各自 d1，产生各自 d2
+
+for iteration 2:
+  8 个请求一起输入各自 d2，产生各自 d3
+```
+
+不是：
+
+```text
+先给请求 0 跑完 K 步
+再给请求 1 跑完 K 步
+```
+
+所以：
+
+```text
+K 维度串行
+batch 维度并行
+```
+
+### 20.9 K=0、K=1 和 parallel drafting
+
+#### K=0
+
+Dynamic speculative decoding 可能令 K=0。Drafter first pass 仍然执行，以
+保持 Draft KV 与 Target 进度同步，但返回：
+
+```text
+shape = [batch_size, 0]
+```
+
+#### K=1
+
+First pass 产生 `d0` 后直接返回，不进入 `for` 循环。
+
+#### Parallel drafting
+
+`parallel_drafting=True` 时也不会进入标准 `K-1` 循环。它通过扩展后的
+输入和 mask slots，在一次 Draft forward 中生成多个候选。
+
+因此：
+
+```text
+标准 Eagle3:
+  1 次 first pass + K-1 次单 token Draft forward
+
+Parallel Eagle3:
+  1 次扩展后的 Draft forward 产生 K 个候选
+```
+
+### 20.10 常见误区
+
+错误理解：
+
+```text
+K 个 draft token
+= K 个 engine step
+= Scheduler 调度 K 次
+```
+
+正确理解：
+
+```text
+一个 engine step:
+  1 次 Target verify
+  + Proposer 内部同步生成下一轮 K 个 draft
+
+下一个 engine step:
+  Target 才验证这 K 个 draft
+```
+
+传统 decode 生成 N 个 token 通常需要 N 个 Target/engine step。推测解码
+则可能在一次 Target verify 后推进最多 `K+1` 个 token：
+
+```text
+K 个 accepted draft + 1 个 bonus
+```
+
+节省的是昂贵的 Target forward 和 engine step 数量；Drafter 内部仍要
+承担 K 步 feature autoregression，只是 Draft 模型远小于 Target。
+
+一句话总结：
+
+```text
+外层“猜测 -> 验证”跨 step 循环由 Scheduler + ModelRunner 驱动；
+内层连续生成 K 个 token 的循环由 Proposer 在一次 propose() 中跑完。
+Scheduler 只提供 K、KV 空间、下一轮 verify 组织和接受/拒绝记账。
+```
+
+## 21. Target 与 Draft 的关系总结
 
 | 项目 | Target model | Eagle3 Draft model |
 | --- | --- | --- |
@@ -1281,7 +1703,7 @@ Target 批量验证 draft
 使用真实 H 刷新 Draft KV
 ```
 
-## 21. 特殊情况
+## 22. 特殊情况
 
 上述“不物理回滚”主要描述标准 Transformer attention KV。
 
@@ -1289,7 +1711,7 @@ Mamba、GDN 等 recurrent state 不能简单依靠 attention seq_len 忽略尾�
 因此可能在接受/拒绝后执行 state block 拷贝或移位。这属于 recurrent
 state 修正，不是普通 attention KV entry 删除。
 
-## 22. 关键源码索引
+## 23. 关键源码索引
 
 | 主题 | 文件 |
 | --- | --- |
