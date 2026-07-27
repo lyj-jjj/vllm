@@ -502,36 +502,287 @@ position 6 logits -> 验证 draft 80
 position 7 logits -> 全部接受时产生 bonus token
 ```
 
-## 12. Greedy 与随机接受
+## 12. Draft token 的接受比对逻辑
 
-Greedy 模式下：
-
-```text
-accepted = draft_token == target_argmax
-```
-
-随机采样模式下，如果 Draft 概率为 `q(x)`、Target 概率为 `p(x)`：
+Target 验证输入为：
 
 ```text
-acceptance_probability
-  = min(1, p(draft_token) / q(draft_token))
+input:    [60,70,80]
+position: [5, 6, 7]
+draft:       [70,80]
 ```
 
-如果拒绝，则从修正分布采样 recovered token：
+Target logits 与 draft 的对齐关系为：
+
+```text
+Target 在 input 60 后的 logits  <-> draft[0] = 70
+Target 在 input 70 后的 logits  <-> draft[1] = 80
+Target 在 input 80 后的 logits  <-> bonus token
+```
+
+因此不是用 position 6 的 logits 验证 position 6 的 token `70`，而是用
+position 5 在处理完 `60` 后产生的 next-token 分布验证 `70`。
+
+验证必须从第一个 draft token开始顺序执行，并且只能接受一个连续前缀：
+
+```text
+draft[0] 接受 -> 继续验证 draft[1]
+draft[0] 拒绝 -> draft[1] 无条件失效
+draft[1] 拒绝 -> 保留 draft[0]，停止验证后续 draft
+```
+
+### 12.1 Greedy 模式
+
+Greedy 模式下，对每个位置计算 Target argmax：
+
+```text
+target_token = argmax(target_logits)
+accepted = draft_token == target_token
+```
+
+#### 示例一：全部接受
+
+```text
+draft tokens:       [70,80]
+Target argmax:      [70,80]
+Target bonus token: 90
+```
+
+逐位置比较：
+
+```text
+draft[0] = 70, Target argmax = 70 -> 接受
+draft[1] = 80, Target argmax = 80 -> 接受
+```
+
+两个 draft 全部接受，追加 Target 在最后位置采样的 bonus：
+
+```text
+RejectionSampler output = [70,80,90]
+```
+
+#### 示例二：接受一个、拒绝一个
+
+```text
+draft tokens:  [70,80]
+Target argmax: [70,81]
+```
+
+逐位置比较：
+
+```text
+draft[0] = 70, Target argmax = 70 -> 接受
+draft[1] = 80, Target argmax = 81 -> 拒绝
+```
+
+Greedy 模式下，首次不匹配位置的 Target argmax `81` 成为 recovered token：
+
+```text
+RejectionSampler tensor = [70,81,-1]
+最终有效输出            = [70,81]
+```
+
+`-1` 是 placeholder，表示该位置之后的 draft 不再有效。
+
+#### 示例三：第一个 token 就拒绝
+
+```text
+draft tokens:  [70,80]
+Target argmax: [71,...]
+```
+
+因为第一个 token 不匹配：
+
+```text
+draft[0] = 70, Target argmax = 71 -> 拒绝
+draft[1] = 80                    -> 不再验证
+```
+
+输出：
+
+```text
+RejectionSampler tensor = [71,-1,-1]
+最终有效输出            = [71]
+```
+
+### 12.2 随机采样模式
+
+随机模式不是简单比较 token 是否等于 Target argmax。
+
+令当前 draft token 为 `d`：
+
+```text
+q(d) = Draft model 分配给 d 的概率
+p(d) = Target model 分配给 d 的概率
+u    = [0,1) 上的均匀随机数
+```
+
+接受条件：
+
+```text
+q(d) > 0
+并且
+p(d) / q(d) >= u
+```
+
+等价的接受概率为：
+
+```text
+P(accept d) = min(1, p(d) / q(d))
+```
+
+这意味着：
+
+- `p(d) >= q(d)` 时，该 draft token 总是接受；
+- `p(d) < q(d)` 时，以 `p(d) / q(d)` 的概率接受；
+- 随机模式下，即使 draft token 不是 Target argmax，也可能被接受。
+
+#### 随机接受的数值案例
+
+仍然使用：
+
+```text
+draft tokens = [70,80]
+```
+
+验证第一个 draft `70`：
+
+```text
+q(70) = 0.50
+p(70) = 0.40
+u0    = 0.60
+
+p(70) / q(70) = 0.40 / 0.50 = 0.80
+0.80 >= 0.60 -> 接受 70
+```
+
+验证第二个 draft `80`：
+
+```text
+q(80) = 0.40
+p(80) = 0.10
+u1    = 0.70
+
+p(80) / q(80) = 0.10 / 0.40 = 0.25
+0.25 < 0.70 -> 拒绝 80
+```
+
+最终接受前缀为：
+
+```text
+[70]
+```
+
+### 12.3 拒绝后的 recovered token
+
+随机模式拒绝 draft token 后，不能直接从原始 Target 分布 `p(x)` 重新采样，
+否则会破坏 speculative decoding 与 Target 原始采样分布的一致性。
+
+vLLM 从修正分布采样：
 
 ```text
 p_recovered(x)
-  ∝ max(p(x) - q(x), 0)
+  = max(p(x) - q(x), 0)
+    / sum_y max(p(y) - q(y), 0)
 ```
 
-输出结构为：
+以上面拒绝 `80` 的位置为例，简化词表只考虑：
 
 ```text
-部分接受:
-  accepted prefix + recovered token
+token:       80    81    82
+Draft q(x): 0.40  0.20  0.40
+Target p(x):0.10  0.60  0.30
+```
 
+先计算：
+
+```text
+max(p-q, 0):
+
+token 80: max(0.10 - 0.40, 0) = 0
+token 81: max(0.60 - 0.20, 0) = 0.40
+token 82: max(0.30 - 0.40, 0) = 0
+```
+
+归一化后：
+
+```text
+p_recovered(81) = 1
+```
+
+所以 recovered token 为：
+
+```text
+81
+```
+
+RejectionSampler 输出：
+
+```text
+[70,81,-1]
+```
+
+最终有效输出：
+
+```text
+[70,81]
+```
+
+### 12.4 全部接受后的 bonus token
+
+只有全部 draft token 都接受时，才使用 bonus token：
+
+```text
+accepted drafts = [70,80]
+bonus token      = Target 在 input 80 后采样的 token 90
+
+output = [70,80,90]
+```
+
+如果任意 draft 被拒绝，预先计算的 bonus token 会被丢弃，首次拒绝位置改用
+recovered token。
+
+### 12.5 接受结果如何驱动下一轮
+
+令：
+
+```text
+K = draft token 数
+A = accepted draft token 数
+```
+
+则：
+
+```text
+num_rejected = K - A
+num_computed_tokens -= num_rejected
+```
+
+下一轮 Drafter 使用 RejectionSampler 输出中的最后一个有效 token：
+
+```text
 全部接受:
-  accepted drafts + bonus token
+  output = [70,80,90]
+  next_token = 90
+  可用真实 hidden = [H60,H70,H80]
+
+接受一个:
+  output = [70,81]
+  next_token = 81
+  可用真实 hidden = [H60,H70]
+
+全部拒绝:
+  output = [71]
+  next_token = 71
+  可用真实 hidden = [H60]
+```
+
+对应实现主要位于：
+
+```text
+vllm/v1/sample/rejection_sampler.py
+vllm/v1/spec_decode/utils.py
+vllm/v1/core/sched/scheduler.py
 ```
 
 ## 13. 情况一：全部接受
