@@ -188,7 +188,7 @@ positions:       [0,  1,  2,  3,  4]
 因此每个 Draft slot 的输入关系是：
 
 | Draft slot | Target feature | Token embedding |
-|---|---|---|
+| --- | --- | --- |
 | 0 | H10 | E20 |
 | 1 | H20 | E30 |
 | 2 | H30 | E40 |
@@ -232,7 +232,7 @@ draft_logits(i+1) = DraftLMHead(Ĥ(i+1))
 所以每个位置的输出语义是：
 
 | Draft slot | 输入 | 预测 feature | Draft logits 预测 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0 | H10 + E20 | Ĥ20 | token 30 |
 | 1 | H20 + E30 | Ĥ30 | token 40 |
 | 2 | H30 + E40 | Ĥ40 | token 50 |
@@ -438,7 +438,7 @@ DraftKV[layer_0][slot=84]
 ### 10.1 Target KV
 
 | Position | Target KV 内容 |
-|---|---|
+| --- | --- |
 | 0 | token 10 在 Target attention 层产生的 K/V |
 | 1 | token 20 的 Target K/V |
 | 2 | token 30 的 Target K/V |
@@ -448,7 +448,7 @@ DraftKV[layer_0][slot=84]
 ### 10.2 Draft KV
 
 | Position | Draft KV 内容 |
-|---|---|
+| --- | --- |
 | 0 | `H10 + E20` 产生的 Draft K/V |
 | 1 | `H20 + E30` 产生的 Draft K/V |
 | 2 | `H30 + E40` 产生的 Draft K/V |
@@ -611,7 +611,7 @@ positions:       [5, 6, 7]
 对应关系：
 
 | Draft position | 输入 | 预测 feature | logits 预测 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 5 | H60 + E70 | Ĥ70 | token 80 |
 | 6 | H70 + E80 | Ĥ80 | token 90 |
 | 7 | H80 + E90 | Ĥ90 | 新 draft `d0'` |
@@ -781,7 +781,7 @@ positions:          [5,6]
 对应：
 
 | Draft position | 输入 | 预测 feature | logits 预测 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 5 | H60 + E70 | Ĥ70 | token 81 |
 | 6 | H70 + E81 | Ĥ81 | 新 draft `d0'` |
 
@@ -881,7 +881,7 @@ H60 + E71 -> Ĥ71 -> d0'
 ## 16. 三种结果对照
 
 | 验证结果 | 正式输出 | 下一轮可用的真实 Target hidden | 下一轮条件 token |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 全接受 | `[70,80,90]` | `[H60,H70,H80]` | `90` |
 | 接受 70、拒绝 80 | `[70,81]` | `[H60,H70]` | `81` |
 | 70 即拒绝 | `[71]` | `[H60]` | `71` |
@@ -1006,7 +1006,7 @@ rejected slot 都必然设置为 `-1`。
 ## 20. Target 与 Draft 的关系总结
 
 | 项目 | Target model | Eagle3 Draft model |
-|---|---|---|
+| --- | --- | --- |
 | 作用 | 产生权威概率并验证 | 快速产生候选 token |
 | 输入 | token IDs | shifted token IDs + Target feature |
 | feature | 真实 Target hidden | 预测的未来 feature |
@@ -1041,7 +1041,7 @@ state 修正，不是普通 attention KV entry 删除。
 ## 22. 关键源码索引
 
 | 主题 | 文件 |
-|---|---|
+| --- | --- |
 | Scheduler speculative token 调度与回退 | `vllm/v1/core/sched/scheduler.py` |
 | Target forward、hidden 收集和 Drafter 入口 | `vllm/v1/worker/gpu_model_runner.py` |
 | Eagle shift、first pass 和多步 drafting | `vllm/v1/spec_decode/llm_base_proposer.py` |
